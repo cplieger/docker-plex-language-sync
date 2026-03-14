@@ -266,7 +266,7 @@ automatically reconnects with exponential backoff (1s→30s).
 | Tests | 286 |
 | [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 3.8 |
 | [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 3.6 |
-| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 89.8% (29 runs) |
+| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 90.1% (59 runs) |
 | Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
 
 Tests cover stream matching and scoring (audio/subtitle selection
