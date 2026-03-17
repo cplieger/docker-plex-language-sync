@@ -284,6 +284,34 @@ I/O — these are I/O-bound runtime paths that can't be
 meaningfully unit tested, validated instead by Docker healthchecks
 and structured logging in production.
 
+## Security Review
+
+**No vulnerabilities found.** All scans clean across 7 tools.
+
+| Tool | Result |
+|------|--------|
+| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
+| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic) | 0 issues |
+| [trivy](https://trivy.dev/) | 0 vulnerabilities (distroless base) |
+| [grype](https://github.com/anchore/grype) | 0 vulnerabilities |
+| [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
+| [semgrep](https://semgrep.dev/) | 2 info (false positives) |
+| [hadolint](https://github.com/hadolint/hadolint) | Clean |
+
+No inbound network listener; connects outbound to Plex and
+plex.tv only. Supports Docker secrets via `PLEX_TOKEN_FILE`.
+The Plex token is never logged or written to the cache file.
+Runs as `nonroot` on a distroless base image with no shell.
+
+**Details for advanced users:** Response bodies capped at 10 MB
+via `io.LimitReader`. WebSocket read limit 1 MB. Cache writes
+use atomic temp-file + rename. Rating keys validated as numeric
+before URL construction. Explicit `MinVersion: tls.VersionTLS12`
+set on TLS config. Shared user tokens are cached in
+`cache.json` for offline restart; protect the `/config` volume
+accordingly. Semgrep flags the `/tmp/.healthy` marker and the
+opt-in TLS skip (both intentional).
+
 ## Dependencies
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.

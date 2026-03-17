@@ -331,7 +331,7 @@ func newHTTPClient(skipTLS bool) *http.Client {
 	c := &http.Client{Timeout: 30 * time.Second}
 	if skipTLS {
 		c.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
 	}
 	return c
