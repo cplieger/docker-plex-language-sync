@@ -225,16 +225,7 @@ func logConfig(cfg *config) {
 func requireEnv(key string) string {
 	// Support Docker secrets via _FILE suffix.
 	if filePath := os.Getenv(key + "_FILE"); filePath != "" {
-		info, err := os.Stat(filePath)
-		if err != nil {
-			slog.Error("cannot stat secret file", "key", key+"_FILE", "path", filePath, "error", err)
-			os.Exit(1)
-		}
-		if info.Size() > 1<<20 { // 1 MB
-			slog.Error("secret file too large", "key", key+"_FILE", "path", filePath, "size", info.Size())
-			os.Exit(1)
-		}
-		data, err := os.ReadFile(filePath)
+		data, err := readSecretFile(filePath)
 		if err != nil {
 			slog.Error("cannot read secret file", "key", key+"_FILE", "path", filePath, "error", err)
 			os.Exit(1)
@@ -247,6 +238,25 @@ func requireEnv(key string) string {
 		os.Exit(1)
 	}
 	return v
+}
+
+// readSecretFile reads a secret file with size validation using a single file
+// handle to avoid TOCTOU races between stat and read.
+func readSecretFile(filePath string) ([]byte, error) {
+	const maxSecretSize = 1 << 20 // 1 MB
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxSecretSize {
+		return nil, fmt.Errorf("file is %d bytes, exceeds %d byte limit", info.Size(), maxSecretSize)
+	}
+	return io.ReadAll(io.LimitReader(f, maxSecretSize+1))
 }
 
 func envOr(key, fallback string) string {
@@ -2099,5 +2109,4 @@ func (a *app) processRecentlyAdded(ctx context.Context, sinceUnix int64) {
 			}
 		}
 	}
-
 }

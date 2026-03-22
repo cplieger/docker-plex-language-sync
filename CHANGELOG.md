@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.03.21-06dd556 (2026-03-22)
+
+### Added
+
+- Enhance security with TOCTOU protection for secret files
+
 ## 2026.03.17-89def15 (2026-03-17)
 
 ### Fixed
