@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026.04.01-a6d3653 (2026-04-01)
+
+### Added
+
+- Enhance security with TOCTOU protection for secret files
+- Test(plex-language-sync): add test for next update strategy
+- Test(plex-language-sync): add boundary test for cache prune threshold
+- Remove activity trigger and improve subtitle codec selection
+- Add nil check for empty response body
+- Add nil check for response body before closing
+- Add new app for syncing TV show language preferences
+
+### Fixed
+
+- Enforce minimum TLS version for secure connections
+
+### Changed
+
+- Refactor(plex-language-sync): improve code quality and resource handling
+
+### Dependencies
+
+- Update gcr.io/distroless/static-debian13:nonroot docker digest to e3f9456
+
 ## 2026.03.21-06dd556 (2026-03-22)
 
 ### Added
