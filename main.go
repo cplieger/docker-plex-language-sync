@@ -149,6 +149,14 @@ type config struct {
 }
 
 func loadConfig() config {
+	// Set up slog handler early so requireEnv errors use the configured handler.
+	level := slog.LevelInfo
+	if envBool("DEBUG", false) {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: level})))
+
 	cfg := config{
 		plexURL:             requireEnv("PLEX_URL"),
 		plexToken:           requireEnv("PLEX_TOKEN"),
@@ -181,21 +189,9 @@ func loadConfig() config {
 		cfg.updateStrategy = defaultUpdateStrategy
 	}
 
-	// Validate scheduler time format.
-	if parts := strings.SplitN(cfg.schedulerTime, ":", 2); len(parts) != 2 {
+	if valid := validateScheduleTime(cfg.schedulerTime); valid != cfg.schedulerTime {
 		slog.Warn("invalid SCHEDULER_SCHEDULE_TIME, defaulting", "value", cfg.schedulerTime)
-		cfg.schedulerTime = defaultScheduleTime
-	} else {
-		h, hErr := strconv.Atoi(parts[0])
-		m, mErr := strconv.Atoi(parts[1])
-		if hErr != nil || mErr != nil || h < 0 || h > 23 || m < 0 || m > 59 {
-			slog.Warn("invalid SCHEDULER_SCHEDULE_TIME, defaulting", "value", cfg.schedulerTime)
-			cfg.schedulerTime = defaultScheduleTime
-		}
-	}
-
-	if cfg.debug {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		cfg.schedulerTime = valid
 	}
 
 	return cfg
@@ -244,7 +240,11 @@ func requireEnv(key string) string {
 // handle to avoid TOCTOU races between stat and read.
 func readSecretFile(filePath string) ([]byte, error) {
 	const maxSecretSize = 1 << 20 // 1 MB
-	f, err := os.Open(filePath)
+	cleaned := filepath.Clean(filePath)
+	if cleaned != filePath || strings.Contains(filePath, "..") {
+		return nil, fmt.Errorf("path traversal detected in secret file path: %s", filePath)
+	}
+	f, err := os.Open(cleaned)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +267,7 @@ func envOr(key, fallback string) string {
 }
 
 func envBool(key string, fallback bool) bool {
-	v := os.Getenv(key)
+	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return fallback
 	}
@@ -277,6 +277,8 @@ func envBool(key string, fallback bool) bool {
 	case "false", "0", "no":
 		return false
 	default:
+		slog.Warn("unrecognized boolean value, using default",
+			"key", key, "value", v, "default", fallback)
 		return fallback
 	}
 }
@@ -291,6 +293,20 @@ func splitTrim(s string) []string {
 		}
 	}
 	return out
+}
+
+// validateScheduleTime returns the time string if valid, or the default.
+func validateScheduleTime(raw string) string {
+	parts := strings.SplitN(raw, ":", 2)
+	if len(parts) != 2 {
+		return defaultScheduleTime
+	}
+	h, hErr := strconv.Atoi(parts[0])
+	m, mErr := strconv.Atoi(parts[1])
+	if hErr != nil || mErr != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return defaultScheduleTime
+	}
+	return raw
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +414,10 @@ func (c *plexClient) put(ctx context.Context, path string) error {
 }
 
 var errNotFound = errors.New("not found")
+
+// plexTVClient is a shared HTTP client for plex.tv API calls.
+// Always uses standard TLS verification regardless of SKIP_TLS_VERIFICATION.
+var plexTVClient = &http.Client{Timeout: 30 * time.Second}
 
 // drainBody reads and discards up to 4 KB to enable HTTP connection reuse.
 func drainBody(body io.ReadCloser) {
@@ -717,8 +737,7 @@ func (c *plexClient) getSharedUserTokens(ctx context.Context, machineIdentifier 
 	req.Header.Set("Accept", "application/xml")
 	req.Header.Set("X-Plex-Token", c.token)
 
-	// Use a dedicated client for plex.tv — never skip TLS for public endpoints.
-	plexTVClient := &http.Client{Timeout: 30 * time.Second}
+	// Use the shared plex.tv client — never skip TLS for public endpoints.
 	resp, err := plexTVClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("plex.tv shared_servers: %w", err)
@@ -1178,6 +1197,10 @@ func (c *appCache) load() error {
 	if err != nil {
 		return err
 	}
+	if int64(len(data)) >= maxCacheSize {
+		slog.Warn("cache file at size limit, may be truncated",
+			"path", cachePath, "bytes", len(data), "limit", maxCacheSize)
+	}
 	return json.Unmarshal(data, &c.data)
 }
 
@@ -1213,7 +1236,9 @@ func (c *appCache) save() {
 	if err := os.Rename(tmpName, cachePath); err != nil {
 		os.Remove(tmpName)
 		slog.Warn("cache rename failed", "path", cachePath, "error", err)
+		return
 	}
+	slog.Debug("cache saved", "path", cachePath, "bytes", len(data))
 }
 
 func (c *appCache) wasRecentlyProcessed(key string) bool {
@@ -1336,6 +1361,9 @@ func (a *app) shouldIgnoreShow(ctx context.Context, showRatingKey string) bool {
 
 // userTokenRefreshLoop periodically refreshes shared user tokens from plex.tv.
 func (a *app) userTokenRefreshLoop(ctx context.Context) {
+	slog.Info("user token refresh loop started",
+		"interval", userTokenRefreshInterval)
+
 	// Initial refresh.
 	a.users.refreshTokens(ctx, a.client, a.identity.MachineIdentifier, &a.cache)
 
@@ -1351,6 +1379,8 @@ func (a *app) userTokenRefreshLoop(ctx context.Context) {
 		}
 	}
 }
+
+// --- Track synchronization ---
 
 // changeTracksForEpisode applies language preferences from a reference episode
 // to other episodes in the same show/season, using a per-user client.
@@ -1565,10 +1595,14 @@ func (a *app) listen(ctx context.Context) {
 		maxBackoff = 30 * time.Second
 	)
 	backoff := minBackoff
+	reconnecting := false
 
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		if reconnecting {
+			slog.Info("attempting websocket reconnect")
 		}
 		connected, err := a.connectAndListen(ctx)
 		if ctx.Err() != nil {
@@ -1587,6 +1621,7 @@ func (a *app) listen(ctx context.Context) {
 			return
 		}
 		backoff = min(backoff*2, maxBackoff)
+		reconnecting = true
 	}
 }
 
@@ -1600,6 +1635,7 @@ func (a *app) connectAndListen(ctx context.Context) (bool, error) {
 		Host:   a.client.baseURL.Host,
 		Path:   "/:/websockets/notifications",
 	}
+	slog.Debug("connecting to websocket", "url", wsURL.String())
 
 	opts := &websocket.DialOptions{
 		HTTPHeader: http.Header{"X-Plex-Token": {a.client.token}},
@@ -1628,6 +1664,10 @@ func (a *app) connectAndListen(ctx context.Context) (bool, error) {
 	for {
 		_, message, readErr := conn.Read(ctx)
 		if readErr != nil {
+			if strings.Contains(readErr.Error(), "read limited") {
+				slog.Warn("websocket message exceeded read limit",
+					"limit_bytes", 1<<20, "error", readErr)
+			}
 			return true, fmt.Errorf("websocket read: %w", readErr)
 		}
 		var notif wsNotification
@@ -1669,67 +1709,70 @@ func buildStreamCacheKey(userID, ratingKey string, audioID, subID int) string {
 
 func (a *app) handlePlaying(ctx context.Context, events []wsPlayEvent) {
 	for _, ev := range events {
-		if !isRelevantPlayEvent(ev) {
-			continue
-		}
-
-		// Resolve the user from the session's clientIdentifier.
-		userID := a.admin.ID
-		username := a.admin.Name
-		if ev.ClientIdentifier != "" {
-			if uid, uname, err := a.client.getUserFromSession(ctx, ev.ClientIdentifier); err == nil {
-				userID = uid
-				username = uname
-			} else {
-				slog.Debug("could not resolve user from session, using admin",
-					"client", ev.ClientIdentifier, "error", err)
-			}
-		}
-
-		// Skip if session state is unchanged (Plex sends repeated notifications).
-		sessionCacheKey := "session:" + userID + ":" + ev.SessionKey
-		if a.cache.wasRecentlyProcessed(sessionCacheKey) {
-			continue
-		}
-
-		// Use per-user client to fetch episode (sees that user's stream selections).
-		userClient := a.users.clientForUser(userID, a.client)
-		episode, err := userClient.getEpisode(ctx, ev.RatingKey)
-		if err != nil {
-			if !errors.Is(err, errNotFound) {
-				slog.Debug("play event: failed to fetch episode",
-					"key", ev.RatingKey, "user", username, "error", err)
-			}
-			continue
-		}
-		if episode.Type != typeEpisode {
-			continue
-		}
-
-		// Only trigger when the user's stream selection actually changed.
-		// This prevents re-processing on every play progress notification.
-		curAudio, curSub := selectedStreams(episode)
-		audioID, subID := 0, 0
-		if curAudio != nil {
-			audioID = curAudio.ID
-		}
-		if curSub != nil {
-			subID = curSub.ID
-		}
-		streamKey := buildStreamCacheKey(userID, ev.RatingKey, audioID, subID)
-		if a.cache.wasRecentlyProcessed(streamKey) {
-			continue
-		}
-		a.cache.markProcessed(streamKey)
-		a.cache.markProcessed(sessionCacheKey)
-
-		slog.Info("play event detected",
-			"episode", episode.shortName(),
-			"user", username,
-			"state", ev.State)
-
-		a.changeTracksForEpisode(ctx, userClient, userID, episode, "play")
+		a.handlePlayEvent(ctx, ev)
 	}
+}
+
+// handlePlayEvent processes a single play session state notification.
+func (a *app) handlePlayEvent(ctx context.Context, ev wsPlayEvent) {
+	if !isRelevantPlayEvent(ev) {
+		return
+	}
+
+	userID, username := a.resolvePlayEventUser(ctx, ev)
+
+	sessionCacheKey := "session:" + userID + ":" + ev.SessionKey
+	if a.cache.wasRecentlyProcessed(sessionCacheKey) {
+		return
+	}
+
+	userClient := a.users.clientForUser(userID, a.client)
+	episode, err := userClient.getEpisode(ctx, ev.RatingKey)
+	if err != nil {
+		if !errors.Is(err, errNotFound) {
+			slog.Debug("play event: failed to fetch episode",
+				"key", ev.RatingKey, "user", username, "error", err)
+		}
+		return
+	}
+	if episode.Type != typeEpisode {
+		return
+	}
+
+	curAudio, curSub := selectedStreams(episode)
+	audioID, subID := 0, 0
+	if curAudio != nil {
+		audioID = curAudio.ID
+	}
+	if curSub != nil {
+		subID = curSub.ID
+	}
+	streamKey := buildStreamCacheKey(userID, ev.RatingKey, audioID, subID)
+	if a.cache.wasRecentlyProcessed(streamKey) {
+		return
+	}
+	a.cache.markProcessed(streamKey)
+	a.cache.markProcessed(sessionCacheKey)
+
+	slog.Info("play event detected",
+		"episode", episode.shortName(),
+		"user", username,
+		"state", ev.State)
+
+	a.changeTracksForEpisode(ctx, userClient, userID, episode, "play")
+}
+
+// resolvePlayEventUser resolves the user from a play event's client identifier.
+// Falls back to the admin user if the session cannot be resolved.
+func (a *app) resolvePlayEventUser(ctx context.Context, ev wsPlayEvent) (userID, username string) {
+	if ev.ClientIdentifier != "" {
+		if uid, uname, err := a.client.getUserFromSession(ctx, ev.ClientIdentifier); err == nil {
+			return uid, uname
+		}
+		slog.Debug("could not resolve user from session, using admin",
+			"client", ev.ClientIdentifier)
+	}
+	return a.admin.ID, a.admin.Name
 }
 
 // isRelevantTimelineEntry returns true if a timeline entry should be processed
@@ -1789,6 +1832,8 @@ func (a *app) handleTimeline(ctx context.Context, entries []wsTimelineEntry) {
 	}
 }
 
+// --- New/updated episode processing ---
+
 // processNewOrUpdatedEpisodeAllUsers processes a new/updated episode for all
 // known users (admin + shared).
 func (a *app) processNewOrUpdatedEpisodeAllUsers(ctx context.Context, episode *plexEpisode, trigger string) {
@@ -1816,10 +1861,20 @@ func (a *app) processNewOrUpdatedEpisode(ctx context.Context, userClient *plexCl
 		return
 	}
 
-	// Find the last watched episode (highest season+episode number that has
-	// audio streams selected) as the reference.
+	// Find the latest episode (highest season+episode number) that has
+	// audio streams as the reference for language settings.
 	var reference *plexEpisode
+	const maxRefSearchDepth = 50
+	searched := 0
 	for i := len(episodes) - 1; i >= 0; i-- {
+		if searched >= maxRefSearchDepth {
+			slog.Debug("reference search depth limit reached",
+				"show", episode.GrandparentTitle,
+				"user", username,
+				"searched", searched)
+			break
+		}
+		searched++
 		ep := &episodes[i]
 		if ep.RatingKey == episode.RatingKey {
 			continue // Skip the new episode itself.
@@ -1834,6 +1889,12 @@ func (a *app) processNewOrUpdatedEpisode(ctx context.Context, userClient *plexCl
 			break
 		}
 	}
+
+	slog.Debug("reference search completed",
+		"show", episode.GrandparentTitle,
+		"user", username,
+		"searched", searched,
+		"found", reference != nil)
 
 	if reference == nil {
 		// No reference episode found — try language profiles.
@@ -1898,12 +1959,13 @@ func subtitleCodecScore(codec string) int {
 	}
 }
 
+// --- Language profiles ---
+
 // applyLanguageProfile applies a learned language profile to a new episode
 // when no reference episode exists in the show. This handles the case where
 // a brand new show is added and the user has established preferences
 // (e.g., Japanese audio → English subtitles for anime).
 func (a *app) applyLanguageProfile(ctx context.Context, userClient *plexClient, userID string, episode *plexEpisode, trigger string) bool {
-	username := a.users.userName(userID)
 	target, err := userClient.getEpisode(ctx, episode.RatingKey)
 	if err != nil {
 		return false
@@ -1925,30 +1987,8 @@ func (a *app) applyLanguageProfile(ctx context.Context, userClient *plexClient, 
 		return false
 	}
 
-	changed := false
-
-	if subLang == "" {
-		// Profile says no subtitles for this audio language.
-		if curSub != nil {
-			if err := userClient.disableSubtitles(ctx, partID); err != nil {
-				slog.Warn("failed to disable subtitles via profile",
-					"episode", target.shortName(), "user", username, "error", err)
-			} else {
-				changed = true
-			}
-		}
-	} else {
-		bestSub := findSubtitleByLanguage(subtitleStreams(target), subLang)
-		if bestSub != nil && (curSub == nil || curSub.ID != bestSub.ID) {
-			if err := userClient.setSubtitleStream(ctx, partID, bestSub.ID); err != nil {
-				slog.Warn("failed to set subtitle via profile",
-					"episode", target.shortName(), "user", username, "error", err)
-			} else {
-				changed = true
-			}
-		}
-	}
-
+	username := a.users.userName(userID)
+	changed := applyProfileSubtitle(ctx, userClient, target, partID, subLang, curSub, username)
 	if changed {
 		slog.Info("language profile applied to new show",
 			"trigger", trigger,
@@ -1958,6 +1998,35 @@ func (a *app) applyLanguageProfile(ctx context.Context, userClient *plexClient, 
 			"subtitle_lang", subLang)
 	}
 	return changed
+}
+
+// applyProfileSubtitle sets or disables the subtitle stream based on the
+// learned language profile. It returns true when the stream was changed.
+func applyProfileSubtitle(ctx context.Context, userClient *plexClient, target *plexEpisode, partID int, subLang string, curSub *plexStream, username string) bool {
+
+	if subLang == "" {
+		// Profile says no subtitles for this audio language.
+		if curSub == nil {
+			return false
+		}
+		if err := userClient.disableSubtitles(ctx, partID); err != nil {
+			slog.Warn("failed to disable subtitles via profile",
+				"episode", target.shortName(), "user", username, "error", err)
+			return false
+		}
+		return true
+	}
+
+	bestSub := findSubtitleByLanguage(subtitleStreams(target), subLang)
+	if bestSub == nil || (curSub != nil && curSub.ID == bestSub.ID) {
+		return false
+	}
+	if err := userClient.setSubtitleStream(ctx, partID, bestSub.ID); err != nil {
+		slog.Warn("failed to set subtitle via profile",
+			"episode", target.shortName(), "user", username, "error", err)
+		return false
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,7 +2102,8 @@ func (a *app) deepAnalysis(ctx context.Context) {
 	a.processRecentHistory(ctx, sinceUnix)
 	a.processRecentlyAdded(ctx, sinceUnix)
 
-	slog.Info("deep analysis completed")
+	slog.Info("deep analysis completed",
+		"since", time.Unix(sinceUnix, 0).Format(time.RFC3339))
 }
 
 // processRecentHistory replays language settings from the last 24h of play history.
@@ -2043,6 +2113,8 @@ func (a *app) processRecentHistory(ctx context.Context, sinceUnix int64) {
 		slog.Warn("scheduler: failed to fetch history", "error", err)
 		return
 	}
+	slog.Debug("scheduler: processing recent history",
+		"items", len(history))
 	for _, item := range history {
 		if ctx.Err() != nil {
 			return
@@ -2057,6 +2129,8 @@ func (a *app) processRecentHistory(ctx context.Context, sinceUnix int64) {
 		userClient := a.users.clientForUser(userID, a.client)
 		ep, fetchErr := userClient.getEpisode(ctx, item.RatingKey)
 		if fetchErr != nil {
+			slog.Debug("scheduler: skipping history item, fetch failed",
+				"key", item.RatingKey, "user", userID, "error", fetchErr)
 			continue
 		}
 		a.changeTracksForEpisode(ctx, userClient, userID, ep, "scheduler")
@@ -2070,8 +2144,9 @@ func (a *app) processRecentlyAdded(ctx context.Context, sinceUnix int64) {
 		slog.Warn("scheduler: failed to fetch sections", "error", err)
 		return
 	}
+	slog.Debug("scheduler: scanning recently added episodes",
+		"sections", len(sections))
 
-	allUsers := a.users.allUsers(a.client.token)
 	for _, section := range sections {
 		if ctx.Err() != nil {
 			return
@@ -2089,24 +2164,28 @@ func (a *app) processRecentlyAdded(ctx context.Context, sinceUnix int64) {
 			if ctx.Err() != nil {
 				return
 			}
-			ep := &episodes[i]
-			cacheKey := "scheduler:" + ep.RatingKey
-			if a.cache.wasRecentlyProcessed(cacheKey) {
-				continue
-			}
-			a.cache.markProcessed(cacheKey)
-
-			slog.Info("scheduler: processing recently added episode",
-				"episode", ep.shortName())
-
-			for _, u := range allUsers {
-				userClient := a.users.clientForUser(u.ID, a.client)
-				full, fetchErr := userClient.getEpisode(ctx, ep.RatingKey)
-				if fetchErr != nil {
-					continue
-				}
-				a.processNewOrUpdatedEpisode(ctx, userClient, u.ID, full, "scheduler")
-			}
+			a.processRecentlyAddedEpisode(ctx, &episodes[i])
 		}
+	}
+}
+
+// processRecentlyAddedEpisode handles a single recently added episode for all users.
+func (a *app) processRecentlyAddedEpisode(ctx context.Context, ep *plexEpisode) {
+	cacheKey := "scheduler:" + ep.RatingKey
+	if a.cache.wasRecentlyProcessed(cacheKey) {
+		return
+	}
+	a.cache.markProcessed(cacheKey)
+
+	slog.Info("scheduler: processing recently added episode",
+		"episode", ep.shortName())
+
+	for _, u := range a.users.allUsers(a.client.token) {
+		userClient := a.users.clientForUser(u.ID, a.client)
+		full, fetchErr := userClient.getEpisode(ctx, ep.RatingKey)
+		if fetchErr != nil {
+			continue
+		}
+		a.processNewOrUpdatedEpisode(ctx, userClient, u.ID, full, "scheduler")
 	}
 }

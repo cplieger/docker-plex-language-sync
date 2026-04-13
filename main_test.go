@@ -3147,3 +3147,114 @@ func TestCachePruneOldEntriesBoundary(t *testing.T) {
 		t.Error("entry at now should NOT be pruned")
 	}
 }
+
+// --- Tests: readSecretFile ---
+
+func TestReadSecretFileOversized(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+
+	// Create a file just over 1 MB (maxSecretSize).
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(1<<20 + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	_, err = readSecretFile(path)
+	if err == nil {
+		t.Fatal("readSecretFile() should fail for oversized file")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("readSecretFile() error = %q, want error containing 'exceeds'", err)
+	}
+}
+
+func TestReadSecretFileNotFound(t *testing.T) {
+	t.Parallel()
+	_, err := readSecretFile("/nonexistent/path/secret.txt")
+	if err == nil {
+		t.Fatal("readSecretFile() should fail for nonexistent file")
+	}
+}
+
+func TestReadSecretFileValid(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(path, []byte("my-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := readSecretFile(path)
+	if err != nil {
+		t.Fatalf("readSecretFile() error = %v", err)
+	}
+	if string(data) != "my-secret\n" {
+		t.Errorf("readSecretFile() = %q, want %q", string(data), "my-secret\n")
+	}
+}
+
+func TestReadSecretFileExactLimit(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "exact.txt")
+
+	// Create a file exactly at 1 MB (maxSecretSize) — should succeed.
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(1 << 20); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	_, err = readSecretFile(path)
+	if err != nil {
+		t.Errorf("readSecretFile() should succeed for file exactly at limit, got %v", err)
+	}
+}
+
+func TestReadSecretFilePathTraversal(t *testing.T) {
+	t.Parallel()
+	_, err := readSecretFile("/run/secrets/../../etc/passwd")
+	if err == nil {
+		t.Fatal("readSecretFile() should reject path traversal")
+	}
+	if !strings.Contains(err.Error(), "path traversal") {
+		t.Errorf("readSecretFile() error = %q, want error containing 'path traversal'", err)
+	}
+}
+
+// --- Tests: validateScheduleTime ---
+
+func TestValidateScheduleTime(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"14:30", "14:30"},
+		{"00:00", "00:00"},
+		{"23:59", "23:59"},
+		{"25:00", defaultScheduleTime},
+		{"12:60", defaultScheduleTime},
+		{"abc", defaultScheduleTime},
+		{"", defaultScheduleTime},
+		{"-1:30", defaultScheduleTime},
+		{"12:-5", defaultScheduleTime},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := validateScheduleTime(tt.input); got != tt.want {
+				t.Errorf("validateScheduleTime(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}

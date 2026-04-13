@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026.04.13-98ff0b3 (2026-04-13)
+
+### Changed
+
+- Refactor(plex-language-sync): improve error handling, logging, and code organization
+- Update Go toolchain configuration
+
+### Dependencies
+
+- Update go to v1.26.2
+- Update golang:1.26-alpine docker digest to c2a1f7b (#174)
+
 ## 2026.04.07-6860326 (2026-04-08)
 
 ### Changed
